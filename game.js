@@ -77,12 +77,23 @@
       this.tick = 0; this.cycle = 0; this.attacks = []; this.recent = [];
     }
     boundary() { return this.start + (this.cycle+1)*16*this.beat; }
+    replyStart() { return this.start + (this.cycle*16+8)*this.beat; }
+    gap(from, until) {
+      // Both intervals are half-open. Allow for roundoff from converting
+      // integer frames and applying delay on a different arithmetic path.
+      const eps = Number.EPSILON * Math.max(1, this.boundary()) * 4;
+      if (from < this.boundary()-eps && until > this.replyStart()+eps) {
+        this.invalid = true; this.attacks.length = 0;
+      }
+      return !!this.invalid;
+    }
     receive(t) {
-      const offset = t - (this.start + (this.cycle*16+8)*this.beat);
-      if (offset >= 0 && t < this.boundary()) this.attacks.push(offset);
+      const offset = t - this.replyStart();
+      if (!this.invalid && offset >= 0 && t < this.boundary()) this.attacks.push(offset);
     }
     processed(until) {
       if (until < this.boundary()) return;
+      if (this.invalid) { this.invalid = false; this.cycle++; return; }
       const result = score(this.pattern, this.beat, this.attacks);
       this.recent = [...this.recent.slice(-2), accuracy(result.total)];
       const next = this.finish(this.pattern, result, this.recent);
@@ -127,6 +138,8 @@
     const nodes = new Set(), voices = new Set();
     const own = node => (nodes.add(node), node);
     let dead = false, stream, track, processor, timer, watcher, busy = false, transport, last, arrived;
+    const gaps = [], frame = n => Number.isSafeInteger(n) && n >= 0;
+    const timing = (expected, observed) => `expected frame ${expected ?? 'unknown'}, observed frame ${observed} (gap ${frame(expected) && frame(observed) ? ((observed-expected)*1000/ctx.sampleRate).toFixed(2)+' ms' : 'unknown'})`;
     const same = async () => ensure(JSON.stringify(await selected(w)) === JSON.stringify(input), 'Selected input changed. Review the new input before resuming.');
     function stop() {
       if (dead) return; dead = true;
@@ -155,7 +168,7 @@
     async function begin() {
       await ctx.resume(); if (dead) return;
       ensure(ctx.audioWorklet?.addModule && w.AudioWorkletNode, 'AudioWorklet unavailable. Use HTTPS/localhost and a supported browser or Desktop version.');
-      try { await ctx.audioWorklet.addModule('/api/plugins/rhythm_recall/assets/onset-processor.js'); }
+      try { await ctx.audioWorklet.addModule('/api/plugins/rhythm_recall/assets/onset-processor.js?v=0.2.1'); }
       catch (e) { throw new Error(`Could not load Rhythm Recall input processor: ${e.message}`); }
       if (dead) return;
       await same(); if (dead) return;
@@ -180,20 +193,42 @@
       processor.port.onmessage = ({data}) => {
         if (dead) return;
         try {
-          const {startFrame,endFrame,onsets} = data;
-          ensure(Number.isSafeInteger(startFrame) && startFrame >= 0 && Number.isSafeInteger(endFrame) && endFrame > startFrame && (last === undefined || startFrame === last), 'Missing or discontinuous audio frames.');
-          ensure(Array.isArray(onsets) && onsets.every((f,i) => Number.isSafeInteger(f) && f >= startFrame && f < endFrame && (!i || f > onsets[i-1])), 'Invalid input onset frames.');
-          arrived = ctx.currentTime; last = endFrame;
-          ensure(arrived - endFrame/ctx.sampleRate < .45, 'No fresh input frames.');
+          const {type,startFrame,endFrame,expectedFrame,onsets} = data, rate = ctx.sampleRate;
+          if (type === 'reset') throw new Error(`Input clock reset: ${timing(expectedFrame,data.observedFrame)}.`);
+          if (!frame(startFrame) || !frame(endFrame) || endFrame <= startFrame || (last !== undefined && startFrame !== last))
+            throw new Error(`Missing or discontinuous audio frames: ${timing(last,startFrame)}; end frame ${endFrame}.`);
+          const now = ctx.currentTime, age = now - endFrame/rate;
+          if (age >= .45 || age < -.02) throw new Error(`No fresh input frames: ${timing(endFrame,Math.round(now*rate))}.`);
+          const corrected = f => f/rate - correction;
+          if (type === 'gap') {
+            const detail = timing(expectedFrame,endFrame);
+            ensure(frame(expectedFrame) && expectedFrame >= startFrame && expectedFrame-startFrame < 512 && expectedFrame < endFrame && onsets === undefined, `Invalid input gap: ${detail}.`);
+            while (gaps.length && endFrame-gaps[0] >= rate) gaps.shift();
+            ensure(endFrame-expectedFrame <= rate*.1 && gaps.length < 3, `Long or repeated input gaps: ${detail}.`);
+            gaps.push(endFrame); last = endFrame;
+            const affected = transport?.gap(corrected(startFrame),corrected(endFrame));
+            transport?.processed(corrected(endFrame));
+            handlers.gap?.(detail,affected);
+            return; // Only classified PCM refreshes the watchdog or starts play.
+          }
+          const length = endFrame-startFrame;
+          ensure(type === undefined && length >= 512 && length%128 === 0 && length <= rate*.45, 'Invalid input batch.');
+          ensure(Array.isArray(onsets) && onsets.length <= length/128, 'Invalid input onset count.');
+          for (let i=0; i<onsets.length; i++) {
+            const f = onsets[i];
+            ensure(frame(f) && f >= startFrame && f < endFrame && (f-startFrame)%128 === 0 && (!i || f > onsets[i-1]), 'Invalid input onset frames.');
+          }
+          arrived = now; last = endFrame;
           if (!transport) transport = handlers.ready(arrived + .18);
-          for (const f of onsets) { const t = f/ctx.sampleRate - correction; transport.receive(t); handlers.attack(t); }
-          transport.processed(endFrame/ctx.sampleRate - correction);
+          for (const f of onsets) { const t = corrected(f); transport.receive(t); handlers.attack(t); }
+          transport.processed(corrected(endFrame));
         } catch (e) { fail(e); }
       };
       timer = w.setInterval(() => {
         if (dead) return;
         try {
-          ensure(ctx.state === 'running' && ctx.currentTime-arrived < .45, 'No fresh input callbacks.');
+          if (ctx.state !== 'running' || ctx.currentTime-arrived >= .45)
+            throw new Error(`No fresh input callbacks: ${timing(last ?? Math.round(arrived*ctx.sampleRate),Math.round(ctx.currentTime*ctx.sampleRate))}.`);
           if (transport) { transport.schedule(ctx.currentTime,tone); handlers.display(ctx.currentTime); }
         } catch (e) { fail(e); }
       },20);
@@ -287,6 +322,10 @@
             transport = new Transport(at,bpm,pattern,finish); transport.recent = recent;
             text('status','Advance with ≥80% on two of the last three replies.'); text('signal','Listening for attacks…'); return transport;
           }, attack(t) { lastAttack = t; },
+          gap(detail,affected) {
+            lastAttack = null;
+            text('status',`Input gap: ${detail}. ${affected ? 'Reply not scored. The next example repeats the same pattern.' : 'Outside the reply; practice continues.'}`);
+          },
           display(now) {
             const b = Math.floor((now-transport.start)/transport.beat);
             text('signal',lastAttack !== null && now-lastAttack < .2 ? 'Attack detected' : 'Listening for attacks…');
@@ -298,6 +337,7 @@
       } catch (e) { fail(e); }
     }
     function finish(p, result, scores) {
+      text('status','Advance with ≥80% on two of the last three replies.');
       for (const [k,s] of Object.entries({[p.name]:result.total,...result.parts})) add(db[instrument+':'+k] ||= blank(),s);
       if (writable) try { w.localStorage.setItem(storageKey,JSON.stringify(db)); } catch { writable = false; text('storage','Save failed. New progress is in memory only.'); }
       const pass = mastered(scores);

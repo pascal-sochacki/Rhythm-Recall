@@ -11,9 +11,24 @@ class RhythmRecallOnsets extends AudioWorkletProcessor {
   }
 
   process(inputs) {
-    const pcm = inputs[0][0];
+    const pcm = inputs[0]?.[0];
+    // An empty render has no known length but its clock must still advance.
+    if (currentFrame < this.minFrame) {
+      this.port.postMessage({type:'reset', expectedFrame:this.minFrame, observedFrame:currentFrame});
+      return false;
+    }
+    this.minFrame = currentFrame + (pcm?.length || 1);
     if (!pcm?.length) return true; // No active input yet; never invent progress.
-    if (this.nextFrame !== undefined && currentFrame !== this.nextFrame) throw new Error('Discontinuous input frames.');
+    if (this.nextFrame !== undefined && currentFrame > this.nextFrame) {
+      // Include unpublished attacks AND any incomplete RMS window. The port
+      // orders this notice before the first batch on the resumed frame grid.
+      this.port.postMessage({type:'gap', startFrame:this.batchStart, expectedFrame:this.nextFrame, endFrame:currentFrame});
+      this.batchStart = currentFrame;
+      this.count = this.power = 0;
+      this.onsets = [];
+      this.env = .002;
+      this.lastAttack = -Infinity;
+    }
     this.nextFrame = currentFrame + pcm.length;
     this.batchStart ??= currentFrame;
 
