@@ -168,7 +168,7 @@
     async function begin() {
       await ctx.resume(); if (dead) return;
       ensure(ctx.audioWorklet?.addModule && w.AudioWorkletNode, 'AudioWorklet unavailable. Use HTTPS/localhost and a supported browser or Desktop version.');
-      try { await ctx.audioWorklet.addModule('/api/plugins/rhythm_recall/assets/onset-processor.js?v=0.2.1'); }
+      try { await ctx.audioWorklet.addModule('/api/plugins/rhythm_recall/assets/onset-processor.js?v=0.2.2'); }
       catch (e) { throw new Error(`Could not load Rhythm Recall input processor: ${e.message}`); }
       if (dead) return;
       await same(); if (dead) return;
@@ -240,6 +240,91 @@
     begin().catch(fail); return {stop};
   }
 
+  // Longest suffix of the previous snapshot equal to a prefix of this one.
+  // Linear prefix matching keeps even long runs of gate silence cheap.
+  function overlap(previous, pcm) {
+    const prefix = new Uint16Array(pcm.length);
+    let j = 0;
+    for (let i = 1; i < pcm.length; i++) {
+      while (j && pcm[i] !== pcm[j]) j = prefix[j-1];
+      if (pcm[i] === pcm[j]) j++;
+      prefix[i] = j;
+    }
+    j = 0;
+    for (const sample of previous) {
+      while (j && sample !== pcm[j]) j = prefix[j-1];
+      if (sample === pcm[j]) j++;
+    }
+    return j;
+  }
+
+  function pickCheck(rate) {
+    const window = Math.round(rate*.004);
+    let previous, sum = 0, n = 0, envelope = 0, last = -Infinity;
+    return (pcm, now) => {
+      const first = !previous, start = first ? 0 : overlap(previous,pcm);
+      previous = pcm;
+      // A closed gate can produce identical all-zero frames indefinitely.
+      // Rearm on confirmed quiet rather than keeping the last loud envelope.
+      if (start === pcm.length && pcm.every(s=>s === 0)) { envelope = sum = n = 0; return false; }
+      let hit = false;
+      for (let i = start; i < pcm.length; i++) {
+        sum += pcm[i]*pcm[i];
+        if (++n < window) continue;
+        const level = Math.sqrt(sum/n);
+        if (!first && now-last >= 110 && level > .007 + 1.65*envelope) {
+          hit = true; last = now;
+        }
+        envelope = Math.max(level, envelope*.92);
+        sum = n = 0;
+      }
+      return hit;
+    };
+  }
+
+  function nativeCheck(w, handlers) {
+    const a = w.feedBackDesktop?.audio;
+    let dead = false, busy = false, generation = 0, timer, watchdog, identity, detect, checkAt = 0;
+    function stop() {
+      dead = true; detect = identity = null;
+      w.clearInterval(timer); w.clearTimeout(watchdog);
+    }
+    function fail(message) { if (!dead) { stop(); handlers.fail(message); } }
+    async function poll() {
+      if (dead || busy) return;
+      busy = true;
+      const g = generation, current = () => !dead && g === generation;
+      watchdog = w.setTimeout(() => fail('Native audio did not respond.'),1500);
+      try {
+        ensure(['getCurrentDevice','listSources','isAudioRunning','getRawAudioFrame'].every(k=>typeof a?.[k] === 'function'),'Native input check unavailable on this Desktop version.');
+        const running = await a.isAudioRunning(); if (!current()) return;
+        ensure(running === true,'Native audio engine is stopped. Check FeedBack Input Setup.');
+        const now = w.performance.now();
+        if (!identity || now >= checkAt) {
+          const [device,sources] = await Promise.all([a.getCurrentDevice(),a.listSources()]); if (!current()) return;
+          const source = sources?.find(s=>s.id === 0 && s.active && s.deviceKey === 0), rate = device?.sampleRate;
+          ensure(device?.input?.trim() && device.inputType && Number.isInteger(source?.inputChannel) && source.inputChannel >= -1 && Number.isFinite(rate) && rate >= 8000 && rate <= 384000,'Native primary input or sample rate unavailable.');
+          const key = JSON.stringify([device.input,device.inputType,source.inputChannel,rate]);
+          ensure(!identity || key === identity.key,'Native input setup changed. Start a new check.');
+          const routing = source.inputChannel < 0 ? 'default mono (first pair or sole input)' : `channel ${source.inputChannel+1}`;
+          identity = {key,rate,size:Math.min(16384,Math.ceil(rate*.064)),label:`Configured: ${device.input} · ${device.inputType} · ${routing} · host reports ${rate} Hz.`}; checkAt = now+500;
+        }
+        const pcm = await a.getRawAudioFrame(identity.size); if (!current()) return;
+        ensure(Object.prototype.toString.call(pcm) === '[object Float32Array]' && pcm.length === identity.size && pcm.every(Number.isFinite),'Missing or invalid native audio frame.');
+        const first = !detect; detect ||= pickCheck(identity.rate);
+        if (detect(pcm,w.performance.now())) handlers.pick();
+        if (first) handlers.ready(identity.label);
+      } catch (e) { if (current()) fail(e instanceof NativeCheckError ? e.message : 'Native audio request failed. Check FeedBack Input Setup.'); }
+      finally { w.clearTimeout(watchdog); busy = false; }
+    }
+    // Keep native bridge exception strings (which can include device details)
+    // out of the UI. Only these local validation messages are displayed.
+    class NativeCheckError extends Error {}
+    function ensure(ok,message) { if (!ok) throw new NativeCheckError(message); }
+    timer = w.setInterval(poll,25); Promise.resolve().then(poll);
+    return {stop,reset() { generation++; detect = null; checkAt = 0; }};
+  }
+
   function describe(s) {
     const pct = s.hits+s.misses+s.extras ? `${Math.round(100*accuracy(s))}%` : 'Clean rests';
     const timing = s.hits ? ` · ${Math.round(s.absMs/s.hits)} ms mean error (${Math.round(s.signedMs/s.hits)} ms signed)` : '';
@@ -248,17 +333,41 @@
   function mount(w, container) {
     const doc = w.document, host = w.feedBack, quit = doc.getElementById('mg-stage-quit');
     container.innerHTML = `<section class="rr-game"><header><small>EAR TRAINING &nbsp; / &nbsp; 4/4</small><h2>Rhythm Recall</h2><p>Listen for two bars, then echo for two. Pick any note. Keep the pulse.</p></header>
-      <div class="rr-controls"><label>Tempo (BPM) <input data-r="tempo" type="number" min="40" max="150" value="80"></label>
+      <article data-r="diagnostic" hidden><small>DESKTOP · UNSCORED</small><h3>Check my input</h3>
+      <p>Uses FeedBack’s native primary input (source 0, mono, after its noise gate), not the Electron microphone. The physical channel is not verified.</p>
+      <p>Slowly pick 8 times, watching for one flash per pick. Then mute the strings and wait: does the count keep rising? Snapshots can miss or repeat attacks. No click, timing grade or history.</p>
+      <button data-r="check">Check my input</button> <button data-r="zero" disabled>Reset count</button> <button data-r="endCheck" disabled>Stop check</button>
+      <p><strong data-r="count">0 detected picks</strong></p><p role="status" data-r="checkStatus"></p></article>
+      <div data-r="scored"><h3>Scored practice</h3><div class="rr-controls"><label>Tempo (BPM) <input data-r="tempo" type="number" min="40" max="150" value="80"></label>
       <label>Input delay (ms) <input data-r="delay" type="number" min="-100" max="180" value="0"></label>
       <label>Practice <select data-r="mode"><option value="course">Pattern course</option><option value="weak">Weak patterns first</option></select></label></div>
-      <p data-r="input"></p><button data-r="start">Prepare input</button> <button data-r="pause" disabled>Pause</button> <button data-r="leave">Leave</button>
+      <p data-r="input"></p><button data-r="start">Prepare input</button> <button data-r="pause" disabled>Pause</button>
       <p role="status" data-r="status"></p><article><small data-r="phase">READY</small><h3 data-r="pattern"></h3><pre data-r="grid"></pre><p>Each group is one beat: 1 e &amp; a. ● = attack, · = no attack.</p><p data-r="pulse"></p><p data-r="signal"></p></article>
-      <h3>Last reply</h3><p data-r="result">No completed reply yet.</p><details><summary>Local practice history</summary><pre data-r="history"></pre></details><p data-r="storage"></p></section>`;
+      <h3>Last reply</h3><p data-r="result">No completed reply yet.</p><details><summary>Local practice history</summary><pre data-r="history"></pre></details><p data-r="storage"></p></div><button data-r="leave">Leave</button></section>`;
     const el = id => container.querySelector(`[data-r="${id}"]`);
-    const ui = Object.fromEntries('tempo delay mode input start pause leave status phase pattern grid pulse signal result history storage'.split(' ').map(k=>[k,el(k)]));
+    const ui = Object.fromEntries('diagnostic scored check zero endCheck count checkStatus tempo delay mode input start pause leave status phase pattern grid pulse signal result history storage'.split(' ').map(k=>[k,el(k)]));
     const text = (k,v) => { if (ui[k].textContent !== v) ui[k].textContent = v; };
     let alive = true, gen = 0, owner, confirmed, running = false, paused = false, db = {}, writable = true;
     let instrument, pattern = patterns[0], recent = [], transport, beatLabel, lastAttack, activeMode;
+    let diagnostic, count = 0, flash;
+    ui.diagnostic.hidden = !w.feedBackDesktop?.isDesktop;
+    function clearCount() { count = 0; flash?.cancel(); flash = null; text('count','0 detected picks'); }
+    function endCheck(message) {
+      diagnostic?.stop(); diagnostic = null; flash?.cancel(); flash = null;
+      ui.zero.disabled = ui.endCheck.disabled = true; ui.check.disabled = ui.scored.hidden = false;
+      text('checkStatus',message);
+    }
+    function check() {
+      if (!alive || doc.hidden || running || diagnostic || ui.diagnostic.hidden) return;
+      resetAudio(); clearCount(); text('input','Review the scored input before playing.'); text('status','');
+      ui.scored.hidden = ui.check.disabled = true; ui.zero.disabled = ui.endCheck.disabled = false;
+      text('checkStatus','Checking native audio…');
+      diagnostic = nativeCheck(w,{
+        ready:label=>text('checkStatus',`Listening. ${label} Pick slowly, then wait muted.`),
+        pick() { text('count',`${++count} detected ${count === 1 ? 'pick' : 'picks'}`); flash?.cancel(); flash = ui.count.animate?.([{backgroundColor:'#387059'},{backgroundColor:'transparent'}],180); },
+        fail:endCheck
+      });
+    }
     try { db = load(w.localStorage); } catch { writable = false; text('storage','Local progress unavailable or damaged. Practicing in memory only.'); }
     function history() {
       const line = (key,label,unit) => { const s = db[instrument+':'+key]; return s ? `${label}: ${s.attempts} ${unit} · ${describe(s)}` : `${label}: not tried`; };
@@ -272,18 +381,21 @@
     }
     function resetAudio() {
       gen++; owner?.stop(); owner = transport = confirmed = null; running = false; beatLabel = lastAttack = null;
+      ui.check.disabled = false;
       ui.pause.disabled = true; ui.start.disabled = false; text('start','Review input'); text('pulse',''); text('signal','Not listening');
     }
     function pause(message) {
+      if (diagnostic) endCheck('Input check stopped.');
       paused = true; resetAudio(); text('phase','PAUSED'); text('status',message); text('start','Review input to resume');
     }
     function fail(e) { pause(`${e.message || e} Incomplete reply discarded.`); }
     function leave(e) { e?.preventDefault(); e?.stopImmediatePropagation(); stop(); host?.navigate?.('home'); }
     function stop() {
       if (!alive) return; alive = false; resetAudio();
+      if (diagnostic) endCheck('Input check stopped.');
       quit?.removeEventListener('click',leave,true); doc.removeEventListener('visibilitychange',visibility);
       host?.off?.('screen:changing',changing); host?.off?.('working-tuning-changed',changed);
-      ui.start.onclick = ui.pause.onclick = ui.leave.onclick = null;
+      ui.check.onclick = ui.zero.onclick = ui.endCheck.onclick = ui.start.onclick = ui.pause.onclick = ui.leave.onclick = null;
     }
     function visibility() { if (doc.hidden) pause('Backgrounded. Resume from the example.'); }
     function changing(e) { if (e.detail?.id !== 'plugin-minigames') stop(); }
@@ -307,7 +419,7 @@
       } catch (e) { if (alive && g === gen) { fail(e); text('input','No verified input.'); } }
     }
     function start() {
-      if (!alive || running) return; if (!confirmed) { prepare(); return; }
+      if (!alive || running || diagnostic) return; if (!confirmed) { prepare(); return; }
       const bpm = ui.tempo.valueAsNumber, delay = ui.delay.valueAsNumber, mode = ui.mode.value;
       if (!Number.isInteger(bpm) || bpm < 40 || bpm > 150 || !Number.isFinite(delay) || delay < -100 || delay > 180) { text('status','Choose 40–150 whole BPM and an input delay from −100 to +180 ms.'); return; }
       const g = gen;
@@ -315,7 +427,7 @@
         ensure(!doc.hidden && instrument === getInstrument(),'Stage hidden or instrument changed.');
         if (!paused || mode !== activeMode) { pattern = mode === 'weak' ? weakest(db,instrument) : patterns[0]; recent = []; }
         activeMode = mode; paused = false; running = true; showPattern();
-        ui.start.disabled = ui.tempo.disabled = ui.delay.disabled = ui.mode.disabled = true; ui.pause.disabled = false;
+        ui.check.disabled = ui.start.disabled = ui.tempo.disabled = ui.delay.disabled = ui.mode.disabled = true; ui.pause.disabled = false;
         text('status','Opening verified input…');
         owner = audioRun(w,confirmed,delay/1000,{
           ready(at) {
@@ -349,6 +461,8 @@
     quit?.addEventListener('click',leave,true); doc.addEventListener('visibilitychange',visibility);
     host?.on?.('screen:changing',changing); host?.on?.('working-tuning-changed',changed);
     ui.start.onclick = start; ui.leave.onclick = leave; ui.pause.onclick = () => pause('Paused. Resume restarts the two-bar example.');
+    ui.check.onclick = check; ui.endCheck.onclick = () => endCheck('Input check stopped.');
+    ui.zero.onclick = () => { if (diagnostic) { clearCount(); diagnostic.reset(); text('checkStatus','Resetting native input check…'); } };
     prepare(); return {stop};
   }
   if (typeof module === 'object' && module.exports) { module.exports = {motifs,patterns,score,accuracy,mastered,Transport,selected,audioRun,mount,weakest,load}; return; }

@@ -242,6 +242,17 @@ test('stage Quit intercepts scoring handler, desktop prepare does not capture wi
   quit.addEventListener('click',()=>assert.fail('public host quit')); const e=new Event('click',{cancelable:true}); quit.dispatchEvent(e);
   assert.ok(e.defaultPrevented);assert.deepEqual(routes,['home']);assert.equal(listeners.size,0);session.stop();
 });
+test('scored Electron acquisition and playing exclude the native diagnostic',async()=>{
+  const f=fixture(),els={};f.w.feedBackDesktop=desktop();let polls=0;
+  f.w.feedBackDesktop.audio.isAudioRunning=()=>{polls++;return true;};
+  const doc=f.w.document=new EventTarget();doc.getElementById=()=>new EventTarget();
+  f.w.feedBack={workingTuning:{get:()=>({instrument:'guitar'})},on(){},off(){},navigate(){}};
+  const session=mount(f.w,{querySelector:s=>els[s.slice(9,-2)]={}});await flush();
+  els.tempo.valueAsNumber=80;els.delay.valueAsNumber=0;els.mode.value='course';
+  els.start.onclick();assert.equal(els.check.disabled,true);els.check.onclick();await flush();
+  els.check.onclick();assert.equal(polls,0);assert.equal(f.requests.length,1);assert.equal(f.tracks[0].stopped,undefined);
+  els.pause.onclick();assert.ok(f.tracks[0].stopped);assert.equal(els.check.disabled,false);session.stop();
+});
 test('host spec registers once, immediate and queued',()=>{
   const script=fs.readFileSync(require.resolve('../game'),'utf8');for(const immediate of [true,false]) {
     const regs=[],window=immediate?{feedBackMinigames:{register:s=>regs.push(s)}}:{};
