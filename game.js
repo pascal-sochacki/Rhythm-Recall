@@ -56,22 +56,6 @@
     return {total, parts};
   }
 
-  // Short energy windows: a new transient must rise above a slowly decaying
-  // envelope, not merely exceed a volume threshold on successive callbacks.
-  class Detector {
-    constructor() { this.env = .002; this.last = -Infinity; }
-    scan(pcm, start, rate, onset) {
-      for (let i = 0; i < pcm.length; i += 128) {
-        let power = 0, n = Math.min(128, pcm.length - i);
-        for (let j = i; j < i+n; j++) power += pcm[j] * pcm[j];
-        const rms = Math.sqrt(power / n), t = start + i/rate;
-        ensure(Number.isFinite(rms), 'Invalid input samples.');
-        if (rms > .009 && rms > this.env * 1.7 + .004 && t - this.last > .045) { this.last = t; onset(t); }
-        this.env = Math.max(rms, this.env * Math.exp(-n / rate / .028));
-      }
-    }
-  }
-
   const storageKey = 'rhythm_recall.progress.v1';
   function load(storage) {
     const db = JSON.parse(storage.getItem(storageKey) ?? '{}');
@@ -140,14 +124,17 @@
   // Late streams are stopped even if the stage disappears during permission.
   function audioRun(w, input, correction, handlers) {
     const ctx = new (w.AudioContext || w.webkitAudioContext)({latencyHint:'interactive'});
-    const nodes = new Set(), voices = new Set(), detector = new Detector();
+    const nodes = new Set(), voices = new Set();
     const own = node => (nodes.add(node), node);
     let dead = false, stream, track, processor, timer, watcher, busy = false, transport, last, arrived;
     const same = async () => ensure(JSON.stringify(await selected(w)) === JSON.stringify(input), 'Selected input changed. Review the new input before resuming.');
     function stop() {
       if (dead) return; dead = true;
       w.clearInterval(timer); w.clearInterval(watcher);
-      if (processor) processor.onaudioprocess = null;
+      if (processor) {
+        processor.onprocessorerror = processor.port.onmessage = null;
+        processor.port.close();
+      }
       ctx.onstatechange = null;
       if (track) track.onmute = track.onended = null;
       for (const osc of voices) { osc.onended = null; try { osc.stop(); } catch {} }
@@ -167,6 +154,10 @@
     }
     async function begin() {
       await ctx.resume(); if (dead) return;
+      ensure(ctx.audioWorklet?.addModule && w.AudioWorkletNode, 'AudioWorklet unavailable. Use HTTPS/localhost and a supported browser or Desktop version.');
+      try { await ctx.audioWorklet.addModule('/api/plugins/rhythm_recall/assets/onset-processor.js'); }
+      catch (e) { throw new Error(`Could not load Rhythm Recall input processor: ${e.message}`); }
+      if (dead) return;
       await same(); if (dead) return;
       const acquired = await w.navigator.mediaDevices.getUserMedia({audio:{deviceId:{exact:input.id}, channelCount:{ideal:2}, echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
       if (dead) { acquired.getTracks().forEach(t => t.stop()); return; }
@@ -180,23 +171,23 @@
       ctx.onstatechange = () => { if (ctx.state !== 'running') fail(new Error('Audio context interrupted.')); };
       ensure(ctx.state === 'running', 'Audio context suspended.');
       const source = own(ctx.createMediaStreamSource(stream)), split = own(ctx.createChannelSplitter(2));
-      processor = own(ctx.createScriptProcessor(512,1,1));
-      const mute = own(ctx.createGain()); mute.gain.value = 0;
+      processor = own(new w.AudioWorkletNode(ctx,'rhythm-recall-onsets',{numberOfInputs:1,numberOfOutputs:0,channelCount:1,channelCountMode:'explicit'}));
+      processor.onprocessorerror = () => fail(new Error('Input processor failed. Partial reply discarded; resume to retry.'));
       source.connect(split);
       const channels = channel >= 0 ? [channel] : settings.channelCount === 1 ? [0] : [0,1];
       for (const ch of channels) { const g = own(ctx.createGain()); g.gain.value = 1/channels.length; split.connect(g,ch); g.connect(processor); }
-      processor.connect(mute); mute.connect(ctx.destination);
       arrived = ctx.currentTime;
-      processor.onaudioprocess = e => {
+      processor.port.onmessage = ({data}) => {
         if (dead) return;
         try {
-          const pcm = e.inputBuffer.getChannelData(0), duration = pcm.length/ctx.sampleRate;
-          const end = e.playbackTime - correction, start = end-duration;
-          ensure(pcm.length === 512 && Number.isFinite(end) && (last === undefined || (end > last && end-last < duration*1.6)), 'Missing or discontinuous audio frames.');
-          arrived = ctx.currentTime; last = end;
+          const {startFrame,endFrame,onsets} = data;
+          ensure(Number.isSafeInteger(startFrame) && startFrame >= 0 && Number.isSafeInteger(endFrame) && endFrame > startFrame && (last === undefined || startFrame === last), 'Missing or discontinuous audio frames.');
+          ensure(Array.isArray(onsets) && onsets.every((f,i) => Number.isSafeInteger(f) && f >= startFrame && f < endFrame && (!i || f > onsets[i-1])), 'Invalid input onset frames.');
+          arrived = ctx.currentTime; last = endFrame;
+          ensure(arrived - endFrame/ctx.sampleRate < .45, 'No fresh input frames.');
           if (!transport) transport = handlers.ready(arrived + .18);
-          detector.scan(pcm,start,ctx.sampleRate,t => {transport.receive(t); handlers.attack(t);});
-          transport.processed(end);
+          for (const f of onsets) { const t = f/ctx.sampleRate - correction; transport.receive(t); handlers.attack(t); }
+          transport.processed(endFrame/ctx.sampleRate - correction);
         } catch (e) { fail(e); }
       };
       timer = w.setInterval(() => {
@@ -320,7 +311,7 @@
     ui.start.onclick = start; ui.leave.onclick = leave; ui.pause.onclick = () => pause('Paused. Resume restarts the two-bar example.');
     prepare(); return {stop};
   }
-  if (typeof module === 'object' && module.exports) { module.exports = {motifs,patterns,score,accuracy,mastered,Detector,Transport,selected,audioRun,mount,weakest,load}; return; }
+  if (typeof module === 'object' && module.exports) { module.exports = {motifs,patterns,score,accuracy,mastered,Transport,selected,audioRun,mount,weakest,load}; return; }
   if (win.__rhythmRecallLoaded) return; win.__rhythmRecallLoaded = true;
   let stage;
   const spec = {id:'rhythm_recall',title:'Rhythm Recall',start({container}) { stage?.stop(); stage = mount(win,container); },stop() { stage?.stop(); stage = null; }};

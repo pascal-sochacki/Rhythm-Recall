@@ -1,7 +1,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm');
-const {patterns,motifs,score,accuracy,mastered,Transport,Detector,selected,audioRun,weakest,mount,load} = require('../game');
+const {patterns,motifs,score,accuracy,mastered,Transport,selected,audioRun,weakest,mount,load} = require('../game');
 const beat = .75;
 const times = p => [...p.beats].flatMap((k,b)=>motifs[k][1].map(s=>(b+s/4)*beat));
 
@@ -43,21 +43,39 @@ test('audio scheduling: four cycles on one grid, new pattern selected after tail
   assert.equal(results[0].total.hits,8); assert.equal(results[0].total.extras,0);
   assert.throws(()=>transport.schedule(1000,()=>{}),/fell behind/);
 });
+function worklet(start=0,rate=48000) {
+  const messages=[]; let Processor;
+  const scope=vm.createContext({sampleRate:rate,currentFrame:start,
+    AudioWorkletProcessor:class {port={postMessage:m=>messages.push(structuredClone(m))};},
+    registerProcessor(name,Ctor){assert.equal(name,'rhythm-recall-onsets');Processor=Ctor;}});
+  vm.runInContext(fs.readFileSync(require.resolve('../assets/onset-processor.js'),'utf8'),scope);
+  const p=new Processor();return {scope,messages,scan(pcm){p.process([pcm?[pcm]:[]]);scope.currentFrame+=pcm?.length??128;}};
+}
+test('actual processor batches silent heartbeats and carries partial analysis windows',()=>{
+  const p=worklet(8000);p.scan(null);const start=8128;
+  for(const n of [96,160,128,127])p.scan(new Float32Array(n));
+  assert.deepEqual(p.messages,[]);p.scan(new Float32Array(14).fill(.1));
+  assert.deepEqual(p.messages,[{startFrame:start,endFrame:start+512,onsets:[]}]);
+  p.scan(new Float32Array(499).fill(.1));
+  assert.deepEqual(p.messages[1],{startFrame:start+512,endFrame:start+1024,onsets:[start+512]});
+  p.scan(null);assert.throws(()=>p.scan(new Float32Array(128)),/Discontinuous/);
+  assert.throws(()=>worklet().scan(new Float32Array(128).fill(NaN)),/Invalid/);
+});
 test('energy rise detector rejects silence and a sustained tone; distinct reattacks survive',()=>{
-  const d=new Detector(), hits=[]; let t=0;
+  const d=worklet();
   for(const level of [0,.12,.12,.12,0,0,.14]) for(let i=0;i<6;i++) {
-    const pcm=new Float32Array(512).fill(level); d.scan(pcm,t,48000,x=>hits.push(x)); t+=512/48000;
+    d.scan(new Float32Array(512).fill(level));
   }
-  assert.equal(hits.length,2);
+  assert.deepEqual(d.messages.flatMap(m=>m.onsets),[6*512,36*512]);
 });
 test('plucked low bass/guitar waveforms do not retrigger during ring-out',()=>{
   for (const freq of [30.87,41.2,82.4,329.6]) {
-    const detector = new Detector(), strikes=[];
+    const detector = worklet();
     for (let i=0;i<120;i++) {
       const pcm=Float32Array.from({length:512},(_,j)=>{const t=(i*512+j)/48000%0.64;return .15*Math.exp(-5*t)*Math.sin(2*Math.PI*t*freq);});
-      detector.scan(pcm,i*512/48000,48000,t=>strikes.push(t));
+      detector.scan(pcm);
     }
-    assert.equal(strikes.length,2,`${freq} Hz`);
+    assert.equal(detector.messages.flatMap(m=>m.onsets).length,2,`${freq} Hz`);
   }
 });
 test('storage rejects invalid counts instead of replacing historical data',()=>{
@@ -71,10 +89,13 @@ const desktop=()=>({isDesktop:true,audio:{getCurrentDevice:async()=>({input:'DI'
 function fixture() {
   const nodes=[], timers=new Map(), contexts=[], tracks=[], requests=[]; let id=0;
   class Node {constructor(){nodes.push(this);this.gain={};this.connections=[];} connect(...args){this.connections.push(args);} disconnect(){this.disconnected=true;} }
-  class Context {constructor(){contexts.push(this);this.currentTime=0;this.state='running';this.sampleRate=48000;this.destination={};} async resume(){} async close(){this.state='closed';} createMediaStreamSource(){return new Node();} createChannelSplitter(){return new Node();} createGain(){return new Node();} createScriptProcessor(){return this.processor=new Node();}}
+  const loader={async addModule(url){assert.equal(url,'/api/plugins/rhythm_recall/assets/onset-processor.js');}};
+  class Context {constructor(){contexts.push(this);this.audioWorklet=loader;this.currentTime=0;this.state='running';this.sampleRate=48000;this.destination={};} async resume(){} async close(){this.state='closed';} createMediaStreamSource(){return new Node();} createChannelSplitter(){return new Node();} createGain(){return new Node();}}
+  class WorkletNode extends Node {constructor(ctx,name,options){super();ctx.processor=this;assert.equal(name,'rhythm-recall-onsets');this.options=options;this.port={close(){this.closed=true;}};}}
   const input={id:'DI-id',channel:'right'}, media={enumerateDevices:async()=>[{kind:'audioinput',label:'DI',deviceId:'DI-id'}],getUserMedia:async c=>{requests.push(c);const track={label:'DI',readyState:'live',getSettings:()=>({deviceId:'DI-id',channelCount:2}),stop(){this.stopped=true;}};tracks.push(track);return {getTracks:()=>[track],getAudioTracks:()=>[track]};}};
   const w={navigator:{mediaDevices:media},AudioContext:Context,setInterval(fn){timers.set(++id,fn);return id;},clearInterval(k){timers.delete(k);},localStorage:{getItem(k){return k==='slopsmith_notedetect'?JSON.stringify({deviceId:'DI-id',channel:'right'}):null;}}};
-  return {w,nodes,timers,contexts,tracks,media,input,requests};
+  w.AudioWorkletNode=WorkletNode;
+  return {w,nodes,timers,contexts,tracks,media,input,requests,loader};
 }
 test('no OS default, ambiguous native label or stale consent substitution',async()=>{
   const f=fixture(); f.w.localStorage.getItem=()=>'{"deviceId":"default","channel":"mono"}';
@@ -95,16 +116,49 @@ test('verified right-channel capture terminates on discontinuity and cleans all 
   const f=fixture();let error,ready=0;
   audioRun(f.w,f.input,0,{fail:e=>error=e,ready(){ready++;return {processed(){}};}}); await flush();
   assert.deepEqual(f.requests[0].audio.deviceId,{exact:'DI-id'});assert.equal(f.nodes[1].connections[0][1],1);
-  const ctx=f.contexts[0], event={playbackTime:1,inputBuffer:{getChannelData:()=>new Float32Array(512)}};
-  ctx.processor.onaudioprocess(event);ctx.processor.onaudioprocess(event);
-  assert.equal(ready,1);assert.match(error.message,/discontinuous/);assert.equal(ctx.processor.onaudioprocess,null);
+  const ctx=f.contexts[0], event={data:{startFrame:0,endFrame:512,onsets:[]}};
+  ctx.processor.port.onmessage(event);ctx.processor.port.onmessage(event);
+  assert.equal(ready,1);assert.match(error.message,/discontinuous/);assert.equal(ctx.processor.port.onmessage,null);assert.ok(ctx.processor.port.closed);
   assert.ok(f.nodes.every(n=>n.disconnected));assert.ok(f.tracks[0].stopped);assert.equal(f.timers.size,0);
 });
-test('positive correction moves each onset earlier on the scheduling clock',async()=>{
-  const f=fixture(), hits=[];let watermark;
-  const run=audioRun(f.w,f.input,.08,{ready:()=>({receive:t=>hits.push(t),processed:t=>watermark=t}),attack(){},fail:assert.fail});await flush();
-  f.contexts[0].processor.onaudioprocess({playbackTime:2,inputBuffer:{getChannelData:()=>new Float32Array(512).fill(.1)}});
-  assert.deepEqual(hits,[2-.08-512/48000]);assert.equal(watermark,2-.08);run.stop();
+test('batch arrival jitter does not shift onsets or the exclusive scoring watermark',async()=>{
+  for(const correction of [.08,-.06]) {
+    const f=fixture(),events=[];
+    const run=audioRun(f.w,f.input,correction,{ready:()=>({receive:t=>events.push(['onset',t]),processed:t=>events.push(['end',t])}),attack(){},fail:assert.fail});await flush();
+    const ctx=f.contexts[0],p=worklet(96000,44100);ctx.sampleRate=44100;ctx.currentTime=2.35;
+    const pcm=new Float32Array(4096);pcm.fill(.1,0,128);pcm.fill(.1,2048,2176);p.scan(pcm);
+    ctx.processor.port.onmessage({data:p.messages[0]});
+    assert.deepEqual(events,[['onset',96000/44100-correction],['onset',98048/44100-correction],['end',100096/44100-correction]]);run.stop();
+  }
+});
+test('mono averages first pair or uses sole channel; left/right are isolated with no output path',async()=>{
+  for(const [channel,count,indices] of [['mono',2,[0,1]],['mono',1,[0]],['left',2,[0]],['right',2,[1]]]) {
+    const f=fixture();f.input.channel=channel;f.w.localStorage.getItem=()=>JSON.stringify({deviceId:f.input.id,channel});
+    const take=f.media.getUserMedia;f.media.getUserMedia=async c=>{const s=await take(c);s.getAudioTracks()[0].getSettings=()=>({deviceId:f.input.id,channelCount:count});return s;};
+    const run=audioRun(f.w,f.input,0,{fail:assert.fail});await flush();const [source,split,processor]=f.nodes;
+    assert.deepEqual(source.connections,[[split]]);assert.deepEqual(split.connections.map(([g,i])=>{assert.equal(g.gain.value,1/indices.length);assert.deepEqual(g.connections,[[processor]]);return i;}),indices);
+    assert.equal(processor.options.numberOfOutputs,0);assert.deepEqual(processor.connections,[]);run.stop();
+  }
+});
+test('unsupported worklets, module failures and cancelled module loads never acquire input',async()=>{
+  for(const mode of ['missing','rejected','late resolve','late reject']) {
+    const f=fixture();let failure,settle;
+    if(mode==='missing')delete f.w.AudioWorkletNode;
+    else f.loader.addModule=()=>new Promise((resolve,reject)=>{settle=mode==='late resolve'?resolve:()=>reject(Error('404'));});
+    const run=audioRun(f.w,f.input,0,{fail:e=>failure=e});await flush();
+    if(mode.startsWith('late'))run.stop();settle?.();await flush();
+    if(mode.startsWith('late'))assert.equal(failure,undefined);else assert.match(failure.message,mode==='missing'?/AudioWorklet unavailable/:/load.*404/);
+    assert.equal(f.contexts[0].state,'closed');assert.equal(f.requests.length,0);assert.equal(f.nodes.length,0);assert.equal(f.timers.size,0);
+  }
+});
+test('processor failure or missing heartbeat discards capture once and ignores queued events',async()=>{
+  for(const mode of ['processorerror','timeout','stale batch']) {
+    const f=fixture(),errors=[];audioRun(f.w,f.input,0,{ready:assert.fail,fail:e=>errors.push(e.message)});await flush();
+    const ctx=f.contexts[0],p=ctx.processor,message=p.port.onmessage,error=p.onprocessorerror, event={data:{startFrame:0,endFrame:512,onsets:[]}};
+    ctx.currentTime=.5;if(mode==='processorerror')error();else if(mode==='timeout')[...f.timers.values()][0]();else message(event);
+    error();message(event);assert.equal(errors.length,1);assert.match(errors[0],mode==='processorerror'?/processor failed/:/No fresh/);
+    assert.ok(f.tracks[0].stopped && p.port.closed);assert.equal(ctx.state,'closed');assert.equal(p.onprocessorerror,null);assert.ok(f.nodes.every(n=>n.disconnected));assert.equal(f.timers.size,0);
+  }
 });
 test('a changed native identity stops live capture; wrong returned channel count never starts',async()=>{
   for(const wrongChannel of [false,true]) {
