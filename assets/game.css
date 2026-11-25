@@ -1,0 +1,12 @@
+.rr-game {max-width:54rem;margin:auto;padding:clamp(.8rem,3vw,2rem);color:#f2f5ff;background:#151d2c;border-radius:1rem;font:1rem/1.5 system-ui,sans-serif}
+.rr-game h2,.rr-game h3,.rr-game p {margin:.4em 0}
+.rr-game small {color:#8eedcf;letter-spacing:.12em;font-weight:700}
+.rr-controls {display:flex;flex-wrap:wrap;gap:.8rem;margin:1rem 0}
+.rr-controls label {display:grid;gap:.2em}
+.rr-controls input {width:7rem}
+.rr-game button,.rr-controls input,.rr-controls select {font:inherit;padding:.35em .6em;border-radius:.4em}
+.rr-game article {margin:1rem 0;padding:1rem;border:1px solid #517086;border-radius:.6rem;background:#203045}
+.rr-game pre {overflow:auto;font-size:clamp(.76rem,2vw,1rem);line-height:1.7}
+.rr-game details pre {white-space:pre-wrap}
+.rr-game [data-r=input] {overflow-wrap:anywhere}
+.rr-game summary,.rr-game button:not(:disabled) {cursor:pointer}

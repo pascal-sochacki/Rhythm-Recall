@@ -1,0 +1,10 @@
+{
+  "id": "rhythm_recall",
+  "name": "Rhythm Recall",
+  "version": "0.1.0",
+  "private": false,
+  "script": "game.js",
+  "styles": "assets/game.css",
+  "description": "Listen to two bars, echo two bars. Private rhythm practice for guitar and bass.",
+  "minigame": {"title":"Rhythm Recall","tagline":"Two bars to listen. Two bars to answer.","type":"chart-free","scoring":"rhythm-onset"}
+}
